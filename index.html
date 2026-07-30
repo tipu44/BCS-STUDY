@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BCS স্টাডি ক্লক</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#020617" />
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: 'Noto Sans Bengali', system-ui, sans-serif; }
+  .font-serif-bn { font-family: 'Noto Serif Bengali', Georgia, serif; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+</style>
+</head>
+<body class="min-h-screen bg-slate-950 text-stone-100">
+<div id="app" class="flex flex-col items-center px-4 py-8 relative overflow-hidden min-h-screen"></div>
+
+<script>
+// ---------------- Schedule data ----------------
+const toMin = (h, m) => h * 60 + m;
+const BLOCKS = [
+  { id: "morning", start: toMin(6,0), end: toMin(7,30), label: "ভারী পড়া", detail: "নতুন টপিক · বাংলাদেশ ও আন্তর্জাতিক বিষয়াবলি", alarm: true, tone: "primary" },
+  { id: "commute-am", start: toMin(7,30), end: toMin(8,30), label: "অফিসের প্রস্তুতি ও যাতায়াত", detail: "পড়া বন্ধ — এই সময় বিশ্রাম", alarm: false, tone: "rest" },
+  { id: "office-am", start: toMin(8,30), end: toMin(12,0), label: "অফিস", detail: "ফাঁকা সময় পেলে: MCQ practice / vocabulary", alarm: false, tone: "office" },
+  { id: "lunch", start: toMin(12,0), end: toMin(12,30), label: "লাঞ্চ স্টাডি", detail: "ভোকাবুলারি / বাগধারা / current affairs", alarm: true, tone: "primary" },
+  { id: "office-pm", start: toMin(12,30), end: toMin(18,0), label: "অফিস", detail: "ফাঁকা সময় পেলে: হালকা রিভিশন", alarm: false, tone: "office" },
+  { id: "rest-eve", start: toMin(18,0), end: toMin(20,0), label: "যাতায়াত ও বিশ্রাম", detail: "রিচার্জ — এই সময় পড়ার দরকার নেই", alarm: false, tone: "rest" },
+  { id: "evening", start: toMin(20,0), end: toMin(22,0), label: "মূল স্টাডি ব্লক", detail: "লেখা প্র্যাকটিস / নোট / mock question", alarm: true, tone: "primary" },
+];
+const TONE = {
+  primary: { ring:"ring-amber-400/60", bg:"bg-amber-400/10", text:"text-amber-300", dot:"bg-amber-400" },
+  rest:    { ring:"ring-slate-600/40", bg:"bg-slate-800/40", text:"text-slate-400", dot:"bg-slate-600" },
+  office:  { ring:"ring-sky-500/30",   bg:"bg-sky-500/5",    text:"text-sky-300",   dot:"bg-sky-500" },
+};
+const REVISION_OFFSETS = [1,4,7];
+
+// ---------------- helpers ----------------
+function dateKey(d){ return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
+function todayKey(){ return `progress-${dateKey(new Date())}`; }
+function dateLabel(iso){ const d=new Date(iso+"T00:00:00"); return d.toLocaleDateString("bn-BD",{day:"numeric",month:"short"}); }
+function daysBetween(fromIso,toDate){ const from=new Date(fromIso+"T00:00:00"); const to=new Date(dateKey(toDate)+"T00:00:00"); return Math.round((to-from)/86400000); }
+function minToLabel(mins){ const h=Math.floor(mins/60), m=mins%60; const d=new Date(); d.setHours(h,m,0,0); return d.toLocaleTimeString("bn-BD",{hour:"2-digit",minute:"2-digit",hour12:true}); }
+function formatClock(d){ return d.toLocaleTimeString("bn-BD",{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true}); }
+
+function loadJSON(key, fallback){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
+function saveJSON(key, val){ try{ localStorage.setItem(key, JSON.stringify(val)); }catch(e){ alert("সেভ করতে সমস্যা হয়েছে — সম্ভবত স্টোরেজ ভরে গেছে (বড় পিডিএফ)। পুরনো পিডিএফ মুছে আবার চেষ্টা করো।"); } }
+
+// ---------------- state ----------------
+let state = {
+  done: loadJSON(todayKey(), {}),
+  notes: loadJSON("study-notes", []),
+  soundOn: loadJSON("sound-on", true),
+  historyOpen: false,
+};
+let ringing = null;
+let lastTriggered = {};
+let audioCtx = null;
+
+function playAlarm(){
+  if(!state.soundOn) return;
+  try{
+    if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    const beepAt = (delay)=>{
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine"; osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.0001, audioCtx.currentTime+delay);
+      gain.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime+delay+0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime+delay+0.35);
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(audioCtx.currentTime+delay); osc.stop(audioCtx.currentTime+delay+0.4);
+    };
+    [0,0.5,1.0,1.5].forEach(beepAt);
+  }catch(e){ console.error(e); }
+}
+
+// ---------------- actions ----------------
+function toggleDone(id){
+  state.done = { ...state.done, [id]: !state.done[id] };
+  saveJSON(todayKey(), state.done);
+  render();
+}
+function toggleSound(){
+  state.soundOn = !state.soundOn;
+  saveJSON("sound-on", state.soundOn);
+  render();
+}
+function addNote(){
+  const textarea = document.getElementById("note-draft");
+  const text = textarea.value.trim();
+  const fileInput = document.getElementById("note-pdf");
+  const file = fileInput.files[0];
+  const finish = (pdfData, pdfName) => {
+    if(!text && !pdfData) return;
+    const entry = { id: `${Date.now()}`, createdAt: dateKey(new Date()), text, pdfData: pdfData||null, pdfName: pdfName||null, revised:{1:false,4:false,7:false} };
+    state.notes = [entry, ...state.notes];
+    saveJSON("study-notes", state.notes);
+    textarea.value = "";
+    fileInput.value = "";
+    render();
+  };
+  if(file){
+    if(file.size > 4*1024*1024){ alert("পিডিএফ ৪MB এর বেশি হলে ব্রাউজার স্টোরেজে জায়গা হবে না। ছোট ফাইল ব্যবহার করো।"); return; }
+    const reader = new FileReader();
+    reader.onload = () => finish(reader.result, file.name);
+    reader.readAsDataURL(file);
+  } else {
+    finish(null, null);
+  }
+}
+function markRevised(id, offset){
+  state.notes = state.notes.map(n => n.id===id ? {...n, revised:{...n.revised, [offset]: true}} : n);
+  saveJSON("study-notes", state.notes);
+  render();
+}
+function deleteNote(id){
+  if(!confirm("এই নোটটা মুছে ফেলবে?")) return;
+  state.notes = state.notes.filter(n => n.id !== id);
+  saveJSON("study-notes", state.notes);
+  render();
+}
+function toggleHistory(){ state.historyOpen = !state.historyOpen; render(); }
+function dismissRing(){ ringing = null; render(); }
+function openPdf(dataUrl){
+  const w = window.open();
+  w.document.write(`<iframe src="${dataUrl}" style="width:100%;height:100vh;border:none;"></iframe>`);
+}
+
+// ---------------- render ----------------
+function render(){
+  const now = new Date();
+  const nowMin = now.getHours()*60 + now.getMinutes();
+  const nowSec = now.getSeconds();
+  const currentBlock = BLOCKS.find(b => nowMin>=b.start && nowMin<b.end);
+
+  // check alarms
+  BLOCKS.forEach(b=>{
+    if(!b.alarm) return;
+    const key = `${b.id}-${now.toDateString()}`;
+    if(nowMin===b.start && nowSec<2 && lastTriggered[key]!==true){
+      lastTriggered[key] = true;
+      ringing = b;
+      playAlarm();
+    }
+  });
+
+  const completedCount = BLOCKS.filter(b=>state.done[b.id]).length;
+  const activeTotal = BLOCKS.filter(b=>b.tone!=="rest").length;
+
+  const dueTodayItems = [];
+  state.notes.forEach(n=>{
+    const diff = daysBetween(n.createdAt, now);
+    REVISION_OFFSETS.forEach(offset=>{
+      if(diff===offset && !n.revised[offset]) dueTodayItems.push({note:n, offset});
+    });
+  });
+
+  const app = document.getElementById("app");
+  app.innerHTML = `
+    <div class="pointer-events-none absolute -top-40 left-1/2 -translate-x-1/2 w-[600px] h-[600px] rounded-full bg-amber-500/5 blur-3xl"></div>
+
+    <div class="absolute top-6 right-6 md:top-10 md:right-10 select-none" style="transform: rotate(-12deg);">
+      <div class="w-24 h-24 md:w-28 md:h-28 rounded-full border-2 border-rose-500/70 flex items-center justify-center text-center p-2 opacity-70">
+        <span class="text-[10px] md:text-xs font-bold text-rose-400 leading-tight tracking-wide">শুধু<br/>অধ্যয়নের<br/>জন্য</span>
+      </div>
+    </div>
+
+    <header class="w-full max-w-xl mt-4 mb-8 text-center relative z-10">
+      <p class="uppercase tracking-[0.3em] text-[11px] text-slate-500 mb-2">BCS প্রস্তুতি · দৈনিক সময়সূচি</p>
+      <div class="font-mono text-5xl md:text-6xl tabular-nums font-semibold text-stone-50 tracking-tight">${formatClock(now)}</div>
+    </header>
+
+    <div class="w-full max-w-xl mb-8 relative z-10">
+      ${currentBlock ? `
+        <div class="rounded-2xl border ${TONE[currentBlock.tone].ring} ${TONE[currentBlock.tone].bg} p-5 ring-1">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="w-2 h-2 rounded-full ${TONE[currentBlock.tone].dot} animate-pulse"></span>
+            <span class="text-xs uppercase tracking-wider text-slate-400">এখন</span>
+          </div>
+          <h2 class="text-2xl font-serif-bn font-semibold ${TONE[currentBlock.tone].text}">${currentBlock.label}</h2>
+          <p class="text-sm text-slate-400 mt-1">${currentBlock.detail}</p>
+          <p class="text-xs text-slate-500 mt-3">${minToLabel(currentBlock.start)} – ${minToLabel(currentBlock.end)}</p>
+        </div>` : `
+        <div class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5 text-center text-slate-500 text-sm">এই মুহূর্তে কোনো নির্ধারিত ব্লক নেই</div>`}
+    </div>
+
+    <div class="w-full max-w-xl flex items-center justify-between mb-4 relative z-10">
+      <span class="text-xs text-slate-500">আজ সম্পন্ন: ${completedCount}/${activeTotal}</span>
+      <button onclick="toggleSound()" class="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200 transition-colors">
+        ${state.soundOn ? "🔊 এলার্ম চালু" : "🔇 এলার্ম বন্ধ"}
+      </button>
+    </div>
+
+    <div class="w-full max-w-xl space-y-2 relative z-10">
+      ${BLOCKS.map(b=>{
+        const isPast = nowMin >= b.end;
+        const isCurrent = currentBlock && currentBlock.id===b.id;
+        return `
+        <div class="flex items-center gap-3 rounded-xl px-4 py-3 border transition-colors ${isCurrent ? 'border-amber-400/40 bg-amber-400/5' : 'border-slate-800/80 bg-slate-900/20'}">
+          <button ${b.tone==='rest'?'disabled':''} onclick="toggleDone('${b.id}')" class="shrink-0 text-lg ${b.tone==='rest'?'opacity-30 cursor-default':''}">
+            ${state.done[b.id] ? '✅' : '⚪'}
+          </button>
+          <div class="flex-1 min-w-0">
+            <div class="flex items-baseline gap-2">
+              <span class="text-xs font-mono text-slate-500 tabular-nums">${minToLabel(b.start)}</span>
+              <span class="text-sm font-medium truncate ${isPast && b.tone!=='rest' ? 'text-slate-500 line-through':'text-stone-200'}">${b.label}</span>
+              ${b.alarm ? '<span class="text-amber-500/70 text-xs">🔔</span>' : ''}
+            </div>
+            <p class="text-xs text-slate-500 truncate">${b.detail}</p>
+          </div>
+        </div>`;
+      }).join("")}
+    </div>
+
+    <div class="w-full max-w-xl mt-10 relative z-10">
+      <p class="uppercase tracking-[0.25em] text-[11px] text-slate-500 mb-3">আজ কী পড়লাম</p>
+      <div class="rounded-2xl border border-slate-800 bg-slate-900/30 p-4">
+        <textarea id="note-draft" placeholder="আজকের পড়া টপিক লিখো — যেমন: সংবিধানের পঞ্চম সংশোধনী, IPCC রিপোর্ট..." rows="3" class="w-full bg-transparent text-sm text-stone-200 placeholder-slate-600 resize-none outline-none"></textarea>
+        <div class="flex items-center justify-between mt-2 gap-2">
+          <label class="text-xs text-slate-500 flex items-center gap-1.5 cursor-pointer hover:text-slate-300">
+            📎 পিডিএফ যোগ করো (৪MB পর্যন্ত)
+            <input id="note-pdf" type="file" accept="application/pdf" class="hidden" />
+          </label>
+          <button onclick="addNote()" class="flex items-center gap-1.5 px-4 py-2 rounded-full bg-amber-400 text-slate-950 text-xs font-semibold hover:bg-amber-300 transition-colors">
+            ＋ নোট যোগ করো
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="w-full max-w-xl mt-8 relative z-10">
+      <p class="uppercase tracking-[0.25em] text-[11px] text-slate-500 mb-3 flex items-center gap-2">↺ আজকের রিভিশন (১-৪-৭ রুল)</p>
+      ${dueTodayItems.length===0 ? `
+        <div class="rounded-2xl border border-slate-800 bg-slate-900/20 p-4 text-center text-xs text-slate-600">আজ রিভিশনের জন্য কিছু বাকি নেই</div>` :
+        `<div class="space-y-2">
+          ${dueTodayItems.map(({note,offset})=>`
+            <div class="flex items-start gap-3 rounded-xl px-4 py-3 border border-emerald-500/30 bg-emerald-500/5">
+              <button onclick="markRevised('${note.id}',${offset})" class="shrink-0 mt-0.5 text-lg">⚪</button>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-2 mb-0.5">
+                  <span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 font-semibold">Day ${offset}</span>
+                  <span class="text-[11px] text-slate-500">${dateLabel(note.createdAt)} তারিখের পড়া</span>
+                </div>
+                <p class="text-sm text-stone-200">${note.text || '(শুধু পিডিএফ)'}</p>
+                ${note.pdfData ? `<button onclick="openPdf(this.dataset.pdf)" data-pdf="${note.pdfData}" class="text-xs text-sky-400 mt-1">📎 ${note.pdfName}</button>` : ''}
+              </div>
+            </div>`).join("")}
+        </div>`}
+    </div>
+
+    <div class="w-full max-w-xl mt-8 mb-6 relative z-10">
+      <button onclick="toggleHistory()" class="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300 transition-colors">
+        ${state.historyOpen ? '▲' : '▼'} সব নোট (${state.notes.length})
+      </button>
+      ${state.historyOpen ? `
+        <div class="mt-3 space-y-2">
+          ${state.notes.length===0 ? '<p class="text-xs text-slate-600">এখনো কোনো নোট নেই</p>' : state.notes.map(n=>`
+            <div class="rounded-xl border border-slate-800/70 bg-slate-900/20 px-4 py-3">
+              <div class="flex items-center justify-between mb-1">
+                <span class="text-[11px] text-slate-500">${dateLabel(n.createdAt)}</span>
+                <div class="flex items-center gap-1">
+                  ${REVISION_OFFSETS.map(offset=>`<span class="text-[9px] px-1.5 py-0.5 rounded-full font-semibold ${n.revised[offset] ? 'bg-emerald-500/20 text-emerald-400':'bg-slate-800 text-slate-600'}">D${offset}</span>`).join("")}
+                  <button onclick="deleteNote('${n.id}')" class="text-slate-600 hover:text-rose-400 text-xs ml-1">🗑</button>
+                </div>
+              </div>
+              <p class="text-sm text-stone-300">${n.text || ''}</p>
+              ${n.pdfData ? `<button onclick="openPdf(this.dataset.pdf)" data-pdf="${n.pdfData}" class="text-xs text-sky-400 mt-1">📎 ${n.pdfName}</button>` : ''}
+            </div>`).join("")}
+        </div>` : ''}
+    </div>
+
+    <p class="text-[11px] text-slate-600 mb-8 text-center max-w-xs relative z-10">
+      এই পেজ খোলা থাকলে নির্ধারিত সময়ে শব্দ বাজবে। নোট, পিডিএফ ও রিভিশন তথ্য এই ব্রাউজারেই (এই ডিভাইসে) সেভ থাকে।
+    </p>
+
+    ${ringing ? `
+      <div class="fixed inset-0 z-50 bg-slate-950/95 backdrop-blur-sm flex flex-col items-center justify-center px-6">
+        <div class="text-6xl mb-6 animate-bounce">🔔</div>
+        <p class="text-xs uppercase tracking-[0.3em] text-slate-500 mb-2">পড়ার সময় হয়েছে</p>
+        <h3 class="text-3xl font-serif-bn font-semibold text-stone-50 text-center mb-2">${ringing.label}</h3>
+        <p class="text-sm text-slate-400 text-center mb-8 max-w-xs">${ringing.detail}</p>
+        <button onclick="dismissRing()" class="px-6 py-3 rounded-full bg-amber-400 text-slate-950 font-semibold text-sm hover:bg-amber-300 transition-colors">শুরু করছি</button>
+      </div>` : ''}
+  `;
+}
+
+setInterval(render, 1000);
+render();
+
+// register service worker for installability (optional, ignored if sw.js absent)
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('sw.js').catch(()=>{});
+}
+</script>
+</body>
+</html>
